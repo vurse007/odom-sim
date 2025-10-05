@@ -38,12 +38,13 @@ FRICTION = 0.9
 ACCEL_FACTOR = 0.1
 
 # Odometry parameters (in inches)
-# Distance from tracking center to vertical encoder (back center)
-VERTICAL_ENCODER_OFFSET = 8.0  # back encoder offset (inches)
+# Distance from tracking center to encoders
+HORIZONTAL_ENCODER_OFFSET = -8.0  # horizontal encoder offset (inches) - positive = front of center
+VERTICAL_ENCODER_OFFSET = 0.0    # vertical encoder offset (inches) - positive = back of center
 
 # Tracking wheel encoder simulation - 2 encoders as specified
-horizontal_encoder = 0.0    # accumulated distance in pixels (center, measures x-axis movement)
-vertical_encoder = 0.0      # accumulated distance in pixels (back, measures y-axis movement)
+horizontal_encoder = 0.0    # accumulated distance in pixels (measures x-axis movement)
+vertical_encoder = 0.0      # accumulated distance in pixels (measures y-axis movement)
 
 # Previous encoder values for delta calculation
 prev_horizontal_encoder = 0.0
@@ -87,12 +88,15 @@ def simulate_encoders(old_x, old_y, old_angle, new_x, new_y, new_angle):
     local_x = dx_pixels * cos_angle + dy_pixels * sin_angle
     local_y = -dx_pixels * sin_angle + dy_pixels * cos_angle
     
-    # Horizontal encoder (at center) measures side-to-side movement
-    horizontal_encoder += local_x
-    
-    # Vertical encoder (at back) measures forward/backward movement
-    # Also affected by rotation around the tracking center due to offset
+    # Angular change
     dtheta = new_angle - old_angle
+    
+    # Horizontal encoder measures side-to-side movement
+    # Also affected by rotation around the tracking center due to offset (front/back offset affects lateral reading)
+    horizontal_encoder += local_x - (HORIZONTAL_ENCODER_OFFSET * PIXELS_PER_INCH * dtheta)
+    
+    # Vertical encoder measures forward/backward movement
+    # Also affected by rotation around the tracking center due to offset
     vertical_encoder += local_y + (VERTICAL_ENCODER_OFFSET * PIXELS_PER_INCH * dtheta)
 
 def draw_bot(screen, x, y, angle):
@@ -108,12 +112,12 @@ def draw_bot(screen, x, y, angle):
     pygame.draw.polygon(robot_surface, NIB_COLOR, [nib_tip, left, right])
     
     # Draw tracking wheels as specified
-    # Horizontal encoder wheel (exact center) - measures x-axis movement
+    # Horizontal encoder wheel - measures x-axis movement
     horizontal_wheel_x = center[0]
-    horizontal_wheel_y = center[1]
+    horizontal_wheel_y = center[1] - int(HORIZONTAL_ENCODER_OFFSET * PIXELS_PER_INCH / 2)
     pygame.draw.circle(robot_surface, TRACKING_WHEEL_COLOR, (horizontal_wheel_x, horizontal_wheel_y), 3)
     
-    # Vertical encoder wheel (back center) - measures y-axis movement
+    # Vertical encoder wheel - measures y-axis movement
     vertical_wheel_x = center[0]
     vertical_wheel_y = center[1] + int(VERTICAL_ENCODER_OFFSET * PIXELS_PER_INCH / 2)
     pygame.draw.circle(robot_surface, TRACKING_WHEEL_COLOR, (vertical_wheel_x, vertical_wheel_y), 3)
@@ -182,8 +186,9 @@ def odom_update(horizontal_pixels, vertical_pixels):  # Encoder values in pixels
     # Step 3: Calculate change in angle
     dtheta = odom_theta - prev_theta
 
-    # Step 4: Apply vertical encoder offset correction
-    # The vertical encoder is offset from the tracking center, so rotation affects its reading
+    # Step 4: Apply encoder offset corrections
+    # Both encoders are affected by rotation around the tracking center due to their offsets
+    corrected_horizontal_inches = delta_horizontal_inches + (HORIZONTAL_ENCODER_OFFSET * dtheta)
     corrected_vertical_inches = delta_vertical_inches - (VERTICAL_ENCODER_OFFSET * dtheta)
 
     # Step 5: Get average theta for the movement
@@ -194,11 +199,11 @@ def odom_update(horizontal_pixels, vertical_pixels):  # Encoder values in pixels
     sin_avg = math.sin(avg_theta)
     
     # Transform from robot's local frame to global frame
-    # delta_horizontal_inches = local x movement (sideways)
+    # corrected_horizontal_inches = local x movement (sideways) after offset correction
     # corrected_vertical_inches = local y movement (forward/back) after offset correction
     # Note: Using screen coordinate system where positive Y is down
-    global_dx = delta_horizontal_inches * cos_avg - corrected_vertical_inches * sin_avg
-    global_dy = -(delta_horizontal_inches * sin_avg + corrected_vertical_inches * cos_avg)
+    global_dx = corrected_horizontal_inches * cos_avg - corrected_vertical_inches * sin_avg
+    global_dy = -(corrected_horizontal_inches * sin_avg + corrected_vertical_inches * cos_avg)
     # ADD A NEGATIVE SIGN ABOVE BECAUSE PYGAME Y AXIS IS MIRRORED TO IRL, SO WE NEED TO MULTIPLY BY NEGATIVE ONE TO DISPLAY IT PROPERLY
 
     # Step 7: Update global position
