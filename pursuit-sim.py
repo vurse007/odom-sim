@@ -70,7 +70,7 @@ BASE_LOOKAHEAD = 18.0
 MIN_LOOKAHEAD = 6.0
 MAX_LOOKAHEAD = 30.0
 
-HEADING_KP = 1.6
+HEADING_KP = 0.15
 HEADING_BLEND_DIST = 18.0
 HEADING_BLEND_POWER = 3.0
 
@@ -79,9 +79,10 @@ FINAL_HEADING_TOLERANCE = 3.0
 SETTLE_COUNT_TARGET = 15
 
 MAX_SPEED = 1.0
+MAX_ANGULAR_SPEED = 0.12
+MIN_SPEED = 0.2
 
 # Path: list of waypoints in inches + heading radians (IMU frame)
-# Each waypoint: (x_in, y_in, theta_rad)
 path = []
 current_segment_idx = 0
 settle_count = 0
@@ -90,6 +91,9 @@ current_lookahead_radius = BASE_LOOKAHEAD
 
 # Waypoint placement heading (rotate with Q/E)
 place_heading = 0.0
+
+# Track if we've entered final approach (prevents re-entering pursuit after passing target)
+in_final_approach = False
 
 # ============================
 # Helper functions
@@ -266,14 +270,12 @@ def find_lookahead_point(robot_pos, lookahead):
         end = path[i + 1]
         found, pt, t = line_circle_intersection(start, end, robot_pos, lookahead)
         if found:
-            # choose furthest along path
             if (best is None) or (i > best_seg) or (i == best_seg and t > best_t):
                 best = pt
                 best_seg = i
                 best_t = t
 
     if best is not None:
-        # segment progression like your C++ robust logic:
         current_segment_idx = best_seg
         if best_seg < len(path) - 1:
             curr_wp = path[best_seg]
@@ -290,28 +292,14 @@ def calculate_pursuit_curvature(robot_pos, lookahead_point, lookahead):
     dx = lookahead_point[0] - robot_pos[0]
     dy = lookahead_point[1] - robot_pos[1]
 
-    # IMU-style: atan2(dx, dy)
     angle_to_point = math.atan2(dx, dy)
     alpha = wrap_to_pi(angle_to_point - robot_pos[2])
 
     return (2.0 * math.sin(alpha)) / max(lookahead, 1e-6)
 
-def heading_blend_omega(robot_pos, dist_to_final):
-    """Blend toward final heading as we get close, like your VEX code."""
-    final_heading = path[-1][2]
-    heading_error = wrap_to_pi(final_heading - robot_pos[2])
-
-    blend = 1.0 - math.exp(
-        -HEADING_BLEND_POWER *
-        (HEADING_BLEND_DIST - dist_to_final) /
-        HEADING_BLEND_DIST
-    )
-    blend = max(0.0, min(1.0, blend))
-    return blend * HEADING_KP * heading_error
-
 def pure_pursuit_step():
     """Returns (linear_vel_in_per_frame, angular_vel_rad_per_frame)."""
-    global settle_count, current_lookahead_pt, current_lookahead_radius
+    global settle_count, current_lookahead_pt, current_lookahead_radius, in_final_approach
 
     rx = pixels_to_inches(robot_x - WIDTH // 2)
     ry = pixels_to_inches(HEIGHT // 2 - robot_y)
@@ -321,31 +309,77 @@ def pure_pursuit_step():
     dxF = final_x - rx
     dyF = final_y - ry
     dist_to_final = math.hypot(dxF, dyF)
+    
+    heading_error = wrap_to_pi(final_theta - angle)
 
-    # ---------- Terminal handoff (stable settle) ----------
-    TERMINAL_DIST = max(5.0, PATH_COMPLETION_DIST * 2.0)
-
-    if dist_to_final < TERMINAL_DIST:
-        v = min(3.0, dist_to_final * 0.7)
-        heading_error = wrap_to_pi(final_theta - angle)
-        omega = HEADING_KP * heading_error
-        omega = max(-2.0, min(2.0, omega))
-
-        if dist_to_final < PATH_COMPLETION_DIST and abs(math.degrees(heading_error)) < FINAL_HEADING_TOLERANCE:
-            settle_count += 1
-        else:
-            settle_count = 0
-
+    # ---------- Check for arrival ----------
+    if dist_to_final < PATH_COMPLETION_DIST and abs(math.degrees(heading_error)) < FINAL_HEADING_TOLERANCE:
+        settle_count += 1
         if settle_count >= SETTLE_COUNT_TARGET:
             return 0.0, 0.0
+    else:
+        settle_count = max(0, settle_count - 1)  # Decay settle count gradually
 
+    # ---------- Final approach mode ----------
+    # Once we enter final approach, stay in it (no more pursuit)
+    TERMINAL_DIST = 10.0
+    
+    if dist_to_final < TERMINAL_DIST or in_final_approach:
+        in_final_approach = True
+        
         current_lookahead_radius = BASE_LOOKAHEAD
         current_lookahead_pt = (final_x, final_y)
+        
+        # Calculate if we're facing toward or away from target
+        angle_to_target = math.atan2(dxF, dyF)
+        angle_error_to_pos = wrap_to_pi(angle_to_target - angle)
+        
+        # Check if we're facing roughly toward the target (within ~90 degrees)
+        facing_target = abs(angle_error_to_pos) < math.pi / 2
+        
+        # Very close - just rotate to final heading
+        if dist_to_final < PATH_COMPLETION_DIST * 2:
+            omega = HEADING_KP * heading_error
+            omega = max(-MAX_ANGULAR_SPEED, min(MAX_ANGULAR_SPEED, omega))
+            
+            # Tiny forward motion only if facing target and not there yet
+            v = 0.0
+            if facing_target and dist_to_final > PATH_COMPLETION_DIST * 0.5:
+                v = min(0.5, dist_to_final * 0.2)
+            
+            return v, omega
+        
+        # If we overshot (facing away from target), we need to back up or turn around
+        if not facing_target:
+            # Turn toward target first, minimal forward motion
+            omega = HEADING_KP * angle_error_to_pos
+            omega = max(-MAX_ANGULAR_SPEED, min(MAX_ANGULAR_SPEED, omega))
+            
+            # Could optionally drive backward here, but turning is usually better
+            return 0.0, omega
+        
+        # Normal final approach - facing target, drive toward it
+        # Blend between position-seeking and final heading based on distance
+        blend = max(0.0, min(1.0, 1.0 - (dist_to_final / TERMINAL_DIST)))
+        blended_angle_error = (1.0 - blend) * angle_error_to_pos + blend * heading_error
+        
+        omega = HEADING_KP * blended_angle_error
+        omega = max(-MAX_ANGULAR_SPEED, min(MAX_ANGULAR_SPEED, omega))
+        
+        # Speed proportional to distance, with minimum
+        v = min(MAX_SPEED * 0.5, dist_to_final * 0.4)
+        v = max(MIN_SPEED * 0.5, v)
+        
+        # Reduce speed if we need to turn a lot
+        turn_penalty = max(0.3, 1.0 - abs(blended_angle_error) / math.pi)
+        v *= turn_penalty
+        
         return v, omega
 
+    # ---------- Normal pursuit ----------
     settle_count = 0
-
-    # Lookahead (fixed like your base_lookahead; clamp)
+    in_final_approach = False
+    
     lookahead = max(MIN_LOOKAHEAD, min(MAX_LOOKAHEAD, BASE_LOOKAHEAD))
     current_lookahead_radius = lookahead
 
@@ -354,12 +388,33 @@ def pure_pursuit_step():
 
     curvature = calculate_pursuit_curvature(robot_pos, lookahead_pt, lookahead)
 
+    # Speed control
     v = MAX_SPEED
-    if dist_to_final < 12.0:
-        v *= max(0.2, dist_to_final / 12.0)
+    
+    # Slow down based on curvature
+    curvature_factor = max(0.3, 1.0 - abs(curvature) * 5.0)
+    v *= curvature_factor
+    
+    # Slow down approaching end
+    if dist_to_final < 20.0:
+        v *= max(0.3, dist_to_final / 20.0)
+    
+    v = max(MIN_SPEED, min(MAX_SPEED, v))
 
+    # Angular velocity from curvature
     omega = curvature * v
-    omega += heading_blend_omega(robot_pos, dist_to_final)
+    
+    # Add heading blend toward final heading as we approach
+    if dist_to_final < HEADING_BLEND_DIST:
+        blend = 1.0 - math.exp(
+            -HEADING_BLEND_POWER *
+            (HEADING_BLEND_DIST - dist_to_final) /
+            HEADING_BLEND_DIST
+        )
+        blend = max(0.0, min(0.5, blend))
+        omega += blend * HEADING_KP * heading_error
+    
+    omega = max(-MAX_ANGULAR_SPEED, min(MAX_ANGULAR_SPEED, omega))
 
     return v, omega
 
@@ -380,13 +435,11 @@ while running:
             running = False
 
         elif event.type == pygame.MOUSEBUTTONDOWN and ghost_mode:
-            # LEFT CLICK adds waypoint
             if event.button == 1:
                 mx, my = pygame.mouse.get_pos()
                 x_in, y_in = screen_to_field_inches(mx, my)
                 path.append((x_in, y_in, place_heading))
 
-            # RIGHT CLICK sets final heading to face mouse from last waypoint
             if event.button == 3 and len(path) > 0:
                 mx, my = pygame.mouse.get_pos()
                 x_in, y_in = screen_to_field_inches(mx, my)
@@ -398,13 +451,12 @@ while running:
         elif event.type == pygame.KEYDOWN:
             if event.key == pygame.K_RETURN:
                 if ghost_mode and len(path) >= 2:
-                    # Start pursuit
                     autonomous_mode = True
                     ghost_mode = False
                     current_segment_idx = 0
                     settle_count = 0
+                    in_final_approach = False  # Reset final approach flag
 
-                    # Set target display to final
                     target_x, target_y, target_theta = path[-1]
                     print(f"Path started with {len(path)} waypoints. Final: ({target_x:.1f},{target_y:.1f}) @ {math.degrees(target_theta):.1f}°")
 
@@ -414,6 +466,7 @@ while running:
                 current_segment_idx = 0
                 settle_count = 0
                 current_lookahead_pt = None
+                in_final_approach = False  # Reset final approach flag
 
             elif event.key == pygame.K_BACKSPACE and ghost_mode:
                 if len(path) > 0:
@@ -425,7 +478,6 @@ while running:
     keys = pygame.key.get_pressed()
 
     if ghost_mode:
-        # "Ghost" control still works (optional) but now used mostly for heading preview
         ghost_speed = 5.0
         ghost_turn_speed = math.radians(3)
 
@@ -440,7 +492,6 @@ while running:
         if keys[pygame.K_d]:
             ghost_angle += ghost_turn_speed
 
-        # Rotate waypoint placement heading with Q/E
         if keys[pygame.K_q]:
             place_heading -= math.radians(2.5)
         if keys[pygame.K_e]:
@@ -458,10 +509,14 @@ while running:
             print("Arrived at final target!")
             autonomous_mode = False
             ghost_mode = True
+            in_final_approach = False
 
         robot_x += v * PIXELS_PER_INCH * math.sin(angle)
         robot_y -= v * PIXELS_PER_INCH * math.cos(angle)
         angle += omega
+        
+        # Wrap the angle to prevent unbounded growth
+        angle = wrap_to_pi(angle)
 
         half = ROBOT_SIZE // 2
         robot_x = max(half, min(WIDTH - half, robot_x))
@@ -472,7 +527,7 @@ while running:
     odom_update(horizontal_encoder, vertical_encoder)
 
     # =========================================================
-    # DRAW FIELD (UNCHANGED FEEL)
+    # DRAW FIELD
     # =========================================================
     screen.fill(FIELD_COLOR)
 
@@ -495,7 +550,6 @@ while running:
             sx, sy = field_inches_to_screen(path[i][0], path[i][1])
             pygame.draw.circle(screen, (255, 0, 255), (int(sx), int(sy)), 6, 2)
 
-            # heading tick
             tick_len = 18
             ex = sx + tick_len * math.sin(path[i][2])
             ey = sy - tick_len * math.cos(path[i][2])
@@ -505,7 +559,7 @@ while running:
                 nx, ny = field_inches_to_screen(path[i + 1][0], path[i + 1][1])
                 pygame.draw.line(screen, (255, 0, 255), (sx, sy), (nx, ny), 2)
 
-    # Draw "preview waypoint" at mouse with place_heading in ghost mode
+    # Draw preview waypoint at mouse in ghost mode
     if ghost_mode:
         mx, my = pygame.mouse.get_pos()
         pygame.draw.circle(screen, (255, 0, 255), (mx, my), 6, 1)
@@ -513,7 +567,7 @@ while running:
         ey = my - 18 * math.cos(place_heading)
         pygame.draw.line(screen, (255, 0, 255), (mx, my), (ex, ey), 2)
 
-    # Draw target position if set (final waypoint)
+    # Draw target position if set
     if target_x is not None:
         tx, ty = field_inches_to_screen(target_x, target_y)
         pygame.draw.circle(screen, (255, 0, 255), (int(tx), int(ty)), 8, 2)
@@ -522,7 +576,7 @@ while running:
         end_y = ty - line_length * math.cos(target_theta)
         pygame.draw.line(screen, (255, 0, 255), (tx, ty), (end_x, end_y), 2)
 
-    # Draw lookahead circle + lookahead point
+    # Draw lookahead circle + point
     if autonomous_mode and len(path) >= 2:
         pygame.draw.circle(
             screen,
@@ -542,7 +596,7 @@ while running:
     # Draw odometry dot
     draw_odom_position(screen, odom_x, odom_y)
 
-    # Display information (same as boomerang sim, plus waypoint help)
+    # Display information
     actual_x_inches = pixels_to_inches(robot_x - WIDTH // 2)
     actual_y_inches = pixels_to_inches(HEIGHT // 2 - robot_y)
 
@@ -564,8 +618,12 @@ while running:
     if target_x is not None:
         target_text = font.render(f"Target: ({target_x:.1f}, {target_y:.1f}) @ {math.degrees(target_theta):.1f}°", True, (255, 0, 255))
         screen.blit(target_text, (10, 95))
+    
+    # Show final approach status
+    if autonomous_mode and in_final_approach:
+        approach_text = font.render("FINAL APPROACH", True, (0, 255, 255))
+        screen.blit(approach_text, (10, 115))
 
-    # Controls line (kept same style)
     controls_text = font.render("WASD: Move/Control | Q/E: Rotate waypoint heading | ENTER: Run", True, (255, 255, 255))
     screen.blit(controls_text, (10, HEIGHT - 30))
 
